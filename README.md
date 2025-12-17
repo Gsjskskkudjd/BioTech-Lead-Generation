@@ -1,4 +1,4 @@
-# Biotech Lead Generation Demo
+# Biotech Lead Generation
 
 This is a demo web agent/crawler for generating leads in the 3D in-vitro models space for therapies.
 
