@@ -1,0 +1,27 @@
+services:
+
+  # Streamlit biotech lead generator UI
+  streamlit:
+    build:
+      context: .
+      target: streamlit
+    ports:
+      - "8501:8501"
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  # Headless funding signal pipeline (run once or on a schedule)
+  pipeline:
+    build:
+      context: .
+      target: pipeline
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      # Mount Google service account credentials if present
+      - ./google_creds.json:/app/google_creds.json:ro
+    profiles:
+      - pipeline
+    restart: "no"

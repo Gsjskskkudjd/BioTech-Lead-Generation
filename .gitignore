@@ -1,26 +1,48 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
 
 # Virtual environments
-.env/
 .venv/
 venv/
+env/
 ENV/
+
+# Secrets & credentials — never commit these
+.env
+google_creds.json
+*_creds.json
+*_credentials.json
+*.key
+*.pem
+service_account*.json
+gen-lang-client*.json
+
+# Data / database
+data/*.db
+data/*.sqlite
+*.db
+*.sqlite
+
+# Logs
+*.log
 
 # OS metadata
 .DS_Store
 Thumbs.db
 
-# Logs
-*.log
+# IDE
+.vscode/
+.idea/
 
-# Local data artifacts
-/data/
-*.sqlite
-*.db
-
-# Secrets
-.env
-*.json
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/

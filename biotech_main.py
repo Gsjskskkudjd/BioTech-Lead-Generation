@@ -1,423 +1,305 @@
-import os
-import streamlit as st
-import pandas as pd
-from Bio import Entrez
-from bs4 import BeautifulSoup
-import requests
-import google.generativeai as genai
-from dotenv import load_dotenv
-import re
-from urllib.parse import urlparse
-from ddgs import DDGS
 import json
+import os
+import re
+
+import google.generativeai as genai
+import pandas as pd
+import streamlit as st
+from Bio import Entrez
+from ddgs import DDGS
+from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configure Gemini (Free Tier)
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Find available model, prefer stable ones
-preferred_models = ['gemini-pro', 'gemini-1.0-pro', 'gemini-1.5-pro']
-MODEL = None
+PREFERRED_MODELS = ["gemini-pro", "gemini-1.0-pro", "gemini-1.5-pro"]
+_MODEL = None
 try:
-    available = [model.name.replace('models/', '') for model in genai.list_models() if 'generateContent' in model.supported_generation_methods]
-    for pref in preferred_models:
+    available = [
+        m.name.replace("models/", "")
+        for m in genai.list_models()
+        if "generateContent" in m.supported_generation_methods
+    ]
+    for pref in PREFERRED_MODELS:
         if pref in available:
-            MODEL = genai.GenerativeModel(pref)
+            _MODEL = genai.GenerativeModel(pref)
             break
-    if not MODEL and available:
-        MODEL = genai.GenerativeModel(available[0])
-except:
-    MODEL = None
+    if not _MODEL and available:
+        _MODEL = genai.GenerativeModel(available[0])
+except Exception:
+    _MODEL = None
 
-# Global flag for quota
-quota_exceeded = False
+_quota_exceeded = False
+Entrez.email = os.getenv("EMAIL", "demo@example.com")
 
-Entrez.email = os.getenv("EMAIL", "demo@example.com")  # Use env var
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-}
 
 def search_pubmed(keywords, max_results=50):
-    """Search PubMed for papers with given keywords in last 2 years."""
     query = f"({' OR '.join(keywords)}) AND (2023[DP] : 2025[DP])"
     handle = Entrez.esearch(db="pubmed", term=query, retmax=max_results)
     record = Entrez.read(handle)
     handle.close()
     return record["IdList"]
 
+
 def fetch_paper_details(pmid):
-    """Fetch paper details including authors and affiliations."""
     handle = Entrez.efetch(db="pubmed", id=pmid, rettype="xml", retmode="text")
     records = Entrez.read(handle)
     handle.close()
-    paper = records['PubmedArticle'][0]
-    title = paper['MedlineCitation']['Article']['ArticleTitle']
+    paper = records["PubmedArticle"][0]
+    title = paper["MedlineCitation"]["Article"]["ArticleTitle"]
     authors = []
-    for author in paper['MedlineCitation']['Article']['AuthorList']:
-        if 'LastName' in author and 'ForeName' in author:
-            name = f"{author['ForeName']} {author['LastName']}"
-            affil = author.get('AffiliationInfo', [{}])[0].get('Affiliation', '') if author.get('AffiliationInfo') else ''
-            # Extract location from affiliation
-            location = 'Unknown'
-            if affil:
-                parts = affil.split(',')
-                if len(parts) > 1:
-                    location = parts[-2].strip() + ', ' + parts[-1].strip()
-            authors.append({'name': name, 'affiliation': affil, 'location': location})
-    return {'pmid': pmid, 'title': title, 'authors': authors}
+    for author in paper["MedlineCitation"]["Article"].get("AuthorList", []):
+        if "LastName" not in author or "ForeName" not in author:
+            continue
+        name = f"{author['ForeName']} {author['LastName']}"
+        affil_list = author.get("AffiliationInfo", [])
+        affil = affil_list[0].get("Affiliation", "") if affil_list else ""
+        parts = affil.split(",")
+        location = (
+            f"{parts[-2].strip()}, {parts[-1].strip()}" if len(parts) > 1 else "Unknown"
+        )
+        authors.append({"name": name, "affiliation": affil, "location": location})
+    return {"pmid": pmid, "title": title, "authors": authors}
+
+
+def _call_llm(prompt):
+    global _quota_exceeded
+    if not _MODEL or _quota_exceeded:
+        return None
+    try:
+        response = _MODEL.generate_content(prompt)
+        return response.text.strip()
+    except Exception as exc:
+        if "429" in str(exc) or "quota" in str(exc).lower():
+            _quota_exceeded = True
+        print(f"LLM error: {exc}")
+        return None
+
 
 def scrape_conference_attendees():
-    """Scrape conference speakers using web search and LLM."""
     with DDGS() as ddgs:
         results = ddgs.text("SOT toxicology conference speakers 2024", max_results=10)
-    snippets = [r['body'] for r in results]
-    
-    prompt = f"""
-    Extract names of speakers or attendees from the following search snippets about SOT toxicology conference.
-    Snippets: {' '.join(snippets)}
-    
-    Return a list of up to 10 names in JSON format, e.g., ["Name1", "Name2"].
-    """
-    
-    global quota_exceeded
-    if MODEL and not quota_exceeded:
-        prompt = f"""
-        Extract names of speakers or attendees from the following search snippets about SOT toxicology conference.
-        Snippets: {' '.join(snippets)}
-        
-        Return a list of up to 20 names in JSON format, e.g., ["Name1", "Name2"].
-        """
-        
+    snippets = [r["body"] for r in results]
+    combined = " ".join(snippets)
+    prompt = (
+        "Extract names of speakers or attendees from the following search snippets "
+        "about the SOT toxicology conference. "
+        "Return a JSON list of up to 20 names.\n\nSnippets: " + combined
+    )
+    names = []
+    raw = _call_llm(prompt)
+    if raw:
         try:
-            response = MODEL.generate_content(prompt)
-            text = response.text.strip()
-            if text.startswith('```json'):
-                text = text[7:-3].strip()
-            names = json.loads(text)
-        except Exception as e:
-            print(f"LLM error: {e}")
-            if '429' in str(e) or 'quota' in str(e).lower():
-                quota_exceeded = True
-            names = []
-    else:
-        names = []
-    
+            raw = raw.replace("```json", "").replace("```", "").strip()
+            names = json.loads(raw)
+        except Exception:
+            pass
     if not names:
-        for snippet in snippets:
-            names.extend(re.findall(r'[A-Z][a-z]+ [A-Z][a-z]+', snippet))
-        names = list(set(names))[:20]
-    
-    attendees = []
-    for name in names:
-        attendees.append({
-            'name': name,
-            'title': 'Speaker',
-            'company': 'Unknown',
-            'location': 'Unknown',
-            'source': 'Conference'
-        })
-    return attendees
+        names = list(set(re.findall(r"[A-Z][a-z]+ [A-Z][a-z]+", combined)))[:20]
+    return [
+        {"name": n, "title": "Speaker", "company": "Unknown", "location": "Unknown", "source": "Conference"}
+        for n in names
+    ]
+
 
 def enrich_person(person):
-    """Enrich person data using web search and LLM."""
-    name = person['name']
-    company = person.get('company', 'Unknown')
-    
-    # Collect search results
-    linkedin_snippets = []
-    email_snippets = []
-    location_snippets = []
-    
-    with DDGS() as ddgs:
-        linkedin_results = ddgs.text(f'"{name}" "{company}" linkedin', max_results=5)
-        for r in linkedin_results:
-            linkedin_snippets.append(r['body'])
-    
-    with DDGS() as ddgs:
-        email_results = ddgs.text(f'"{name}" "{company}" email', max_results=5)
-        for r in email_results:
-            email_snippets.append(r['body'])
-    
-    with DDGS() as ddgs:
-        location_results = ddgs.text(f'"{company}" headquarters location', max_results=3)
-        for r in location_results:
-            location_snippets.append(r['body'])
-    
-    # Use LLM to extract
-    global quota_exceeded
-    if MODEL and not quota_exceeded:
-        prompt = f"""
-        Extract information for {name} at {company} from the following search snippets.
-        
-        LinkedIn snippets: {' '.join(linkedin_snippets)}
-        Email snippets: {' '.join(email_snippets)}
-        Location snippets: {' '.join(location_snippets)}
-        
-        Return JSON with:
-        - linkedin: LinkedIn URL if found, else null
-        - email: Email if found, else null
-        - location: HQ location if found, else null
-        """
-        
+    name = person["name"]
+    company = person.get("company", "Unknown")
+
+    def _search(query, n=5):
+        with DDGS() as ddgs:
+            return [r["body"] for r in ddgs.text(query, max_results=n)]
+
+    linkedin_snippets = _search(f'"{name}" "{company}" linkedin')
+    email_snippets = _search(f'"{name}" "{company}" email')
+    location_snippets = _search(f'"{company}" headquarters location', n=3)
+
+    prompt = (
+        f"Extract information for {name} at {company} from the search snippets below.\n\n"
+        f"LinkedIn snippets: {' '.join(linkedin_snippets)}\n"
+        f"Email snippets: {' '.join(email_snippets)}\n"
+        f"Location snippets: {' '.join(location_snippets)}\n\n"
+        "Return JSON with keys: linkedin (URL or null), email (string or null), location (string or null)."
+    )
+
+    linkedin = email = location = None
+    raw = _call_llm(prompt)
+    if raw:
         try:
-            response = MODEL.generate_content(prompt)
-            text = response.text.strip()
-            # Remove markdown if present
-            if text.startswith('```json'):
-                text = text[7:-3].strip()
-            data = json.loads(text)
-            linkedin = data.get('linkedin')
-            email = data.get('email')
-            location = data.get('location')
-        except Exception as e:
-            print(f"LLM error: {e}")
-            if '429' in str(e) or 'quota' in str(e).lower():
-                quota_exceeded = True
-            linkedin = None
-            email = None
-            location = None
-    else:
-        linkedin = None
-        email = None
-        location = None
-    
-    person['linkedin'] = linkedin or f"https://linkedin.com/in/{name.replace(' ', '').lower()}"
-    person['email'] = email or f"{name.split()[0].lower()}.{name.split()[-1].lower()}@{company.replace(' ', '').lower()}.com"
+            raw = raw.replace("```json", "").replace("```", "").strip()
+            data = json.loads(raw)
+            linkedin = data.get("linkedin")
+            email = data.get("email")
+            location = data.get("location")
+        except Exception:
+            pass
+
+    person["linkedin"] = linkedin or f"https://linkedin.com/in/{name.replace(' ', '').lower()}"
+    person["email"] = (
+        email
+        or f"{name.split()[0].lower()}.{name.split()[-1].lower()}@{company.replace(' ', '').lower()}.com"
+    )
     if location:
-        person['location'] = location
+        person["location"] = location
     return person
 
+
 def calculate_score(person):
-    """Calculate propensity score using LLM for analysis."""
-    title = person.get('title', '').lower()
-    company = person.get('company', '').lower()
-    location = person.get('location', '').lower()
-    
-    # Collect funding snippets
-    funding_snippets = []
+    title = person.get("title", "").lower()
+    company = person.get("company", "").lower()
+    location = person.get("location", "").lower()
+
     with DDGS() as ddgs:
-        results = ddgs.text(f'"{company}" series funding OR raised OR IPO', max_results=5)
-        for r in results:
-            funding_snippets.append(r['body'])
-    
-    prompt = f"""
-    Analyze the following for {company} in biotech/toxicology space.
-    Title: {title}
-    Location: {location}
-    Funding snippets: {' '.join(funding_snippets)}
-    
-    Assign scores:
-    - Role Fit (0-30): High if title contains toxicology, safety, etc.
-    - Company Intent (0-20): High if recent funding (series A/B, raised money).
-    - Technographic (0-15): Assume 15 for biotech.
-    - Location (0-10): High if in Boston, Cambridge, etc.
-    - Scientific Intent (0-40): High if has recent paper.
-    
-    Return total score (0-100).
-    """
-    
-    global quota_exceeded
-    if MODEL and not quota_exceeded:
-        prompt = f"""
-        Analyze the following for {company} in biotech/toxicology space.
-        Title: {title}
-        Location: {location}
-        Funding snippets: {' '.join(funding_snippets)}
-        
-        Assign scores:
-        - Role Fit (0-30): High if title contains toxicology, safety, etc.
-        - Company Intent (0-20): High if recent funding (series A/B, raised money).
-        - Technographic (0-15): Assume 15 for biotech.
-        - Location (0-10): High if in Boston, Cambridge, etc.
-        - Scientific Intent (0-40): High if has recent paper.
-        
-        Return total score (0-100).
-        """
-        
-        try:
-            response = MODEL.generate_content(prompt)
-            text = response.text.strip()
-            # Extract number
-            score_match = re.search(r'\d+', text)
-            if score_match:
-                score = int(score_match.group())
-            else:
-                score = 0
-        except Exception as e:
-            print(f"LLM error: {e}")
-            if '429' in str(e) or 'quota' in str(e).lower():
-                quota_exceeded = True
-            score = 0
-    else:
-        score = 0
-    
-    # Fallback
-    if any(word in title for word in ['toxicology', 'safety', 'hepatic', '3d', 'preclinical', 'director', 'head']):
+        funding_snippets = [
+            r["body"]
+            for r in ddgs.text(f'"{company}" series funding OR raised OR IPO', max_results=5)
+        ]
+
+    prompt = (
+        f"Analyze {company} in the biotech/toxicology space.\n"
+        f"Title: {title}\nLocation: {location}\n"
+        f"Funding snippets: {' '.join(funding_snippets)}\n\n"
+        "Assign scores: Role Fit (0-30), Company Intent (0-20), Technographic (0-15), "
+        "Location (0-10), Scientific Intent (0-40). Return only the total integer score (0-100)."
+    )
+
+    score = 0
+    raw = _call_llm(prompt)
+    if raw:
+        match = re.search(r"\d+", raw)
+        if match:
+            score = int(match.group())
+
+    if any(w in title for w in ["toxicology", "safety", "hepatic", "3d", "preclinical", "director", "head"]):
         score += 30
-    if any('series' in s.lower() or 'raised' in s.lower() for s in funding_snippets):
+    if any("series" in s.lower() or "raised" in s.lower() for s in funding_snippets):
         score += 20
     score += 15
-    if any(hub in location.lower() for hub in ['boston', 'cambridge', 'san francisco', 'basel', 'london']):
+    if any(hub in location for hub in ["boston", "cambridge", "san francisco", "basel", "london"]):
         score += 10
-    if person.get('has_recent_paper', False):
+    if person.get("has_recent_paper"):
         score += 40
-    
+
     return min(score, 100)
 
-def run_biotech_pipeline():
-    st.title("Biotech Lead Generation Demo")
-    
-    # Check API keys
-    if not os.getenv("GEMINI_API_KEY"):
-        st.error("Please set GEMINI_API_KEY in .env file. Get it from https://aistudio.google.com/app/apikey")
-        return
-    if not os.getenv("EMAIL"):
-        st.error("Please set EMAIL in .env file for PubMed API.")
-        return
 
 def run_biotech_pipeline():
     st.set_page_config(page_title="Biotech Lead Generator", page_icon="🔬", layout="wide")
-    
-    st.title("🔬 Biotech Lead Generation Demo")
+    st.title("Biotech Lead Generator")
     st.markdown("Automated pipeline for identifying, enriching, and ranking biotech leads in 3D in-vitro models.")
-    
-    # Check API keys
+
     if not os.getenv("GEMINI_API_KEY"):
-        st.error("Please set GEMINI_API_KEY in .env file. Get it from https://aistudio.google.com/app/apikey")
+        st.error("Set GEMINI_API_KEY in your .env file.")
         return
     if not os.getenv("EMAIL"):
-        st.error("Please set EMAIL in .env file for PubMed API.")
+        st.error("Set EMAIL in your .env file (required for PubMed API access).")
         return
 
-    # Sidebar
-    st.sidebar.header("📊 Dashboard")
-    total_leads = 0
-    avg_score = 0
-    
-    # Stage 1: Identification
-    with st.spinner("🔍 Identifying leads from PubMed and conferences..."):
-        st.header("1️⃣ Identification")
-        keywords = ["Drug-Induced Liver Injury", "3D cell culture", "Organ-on-chip", "Hepatic spheroids", "Investigative Toxicology"]
+    st.sidebar.header("Dashboard")
+
+    with st.spinner("Identifying leads from PubMed and conferences..."):
+        st.header("1. Identification")
+        keywords = [
+            "Drug-Induced Liver Injury", "3D cell culture", "Organ-on-chip",
+            "Hepatic spheroids", "Investigative Toxicology",
+        ]
         pmids = search_pubmed(keywords, max_results=30)
-        st.write(f"📄 Found {len(pmids)} relevant papers on PubMed.")
-        
+        st.write(f"Found {len(pmids)} relevant papers on PubMed.")
+
         leads = []
         for pmid in pmids:
             paper = fetch_paper_details(pmid)
-            for author in paper['authors']:
-                lead = {
-                    'name': author['name'],
-                    'title': 'Researcher',  # Assume
-                    'company': author['affiliation'].split(',')[0] if author['affiliation'] else 'Unknown',
-                    'location': author['location'],
-                    'source': 'PubMed',
-                    'has_recent_paper': True
-                }
-                leads.append(lead)
-        
-        # Add conference attendees
-        conf_leads = scrape_conference_attendees()
-        for lead in conf_leads:
-            lead['has_recent_paper'] = False
+            for author in paper["authors"]:
+                leads.append({
+                    "name": author["name"],
+                    "title": "Researcher",
+                    "company": author["affiliation"].split(",")[0] if author["affiliation"] else "Unknown",
+                    "location": author["location"],
+                    "source": "PubMed",
+                    "has_recent_paper": True,
+                })
+
+        for lead in scrape_conference_attendees():
+            lead["has_recent_paper"] = False
             leads.append(lead)
-        
-        total_leads = len(leads)
-        st.write(f"👥 Total leads identified: {total_leads}")
-        
-        # Metrics
-        st.sidebar.metric("Total Leads", total_leads)
-        
-    # Stage 2: Enrichment
-    with st.spinner("🔧 Enriching lead data with web searches..."):
-        st.header("2️⃣ Enrichment")
+
+        st.write(f"Total leads identified: {len(leads)}")
+        st.sidebar.metric("Total Leads", len(leads))
+
+    with st.spinner("Enriching lead data..."):
+        st.header("2. Enrichment")
         enriched_leads = []
-        progress_bar = st.progress(0)
-        for i, lead in enumerate(leads[:30]):
-            enriched = enrich_person(lead)
-            enriched_leads.append(enriched)
-            progress_bar.progress((i+1)/30)
-        progress_bar.empty()
-        
-    # Stage 3: Ranking
-    with st.spinner("📈 Calculating propensity scores..."):
-        st.header("3️⃣ Ranking")
+        progress = st.progress(0)
+        batch = leads[:30]
+        for i, lead in enumerate(batch):
+            enriched_leads.append(enrich_person(lead))
+            progress.progress((i + 1) / len(batch))
+        progress.empty()
+
+    with st.spinner("Calculating propensity scores..."):
+        st.header("3. Ranking")
         for lead in enriched_leads:
-            lead['score'] = calculate_score(lead)
-        
-        # Sort by score
-        enriched_leads.sort(key=lambda x: x['score'], reverse=True)
-        
-        avg_score = sum(lead['score'] for lead in enriched_leads) / len(enriched_leads) if enriched_leads else 0
+            lead["score"] = calculate_score(lead)
+        enriched_leads.sort(key=lambda x: x["score"], reverse=True)
+        avg_score = (
+            sum(l["score"] for l in enriched_leads) / len(enriched_leads)
+            if enriched_leads else 0
+        )
         st.sidebar.metric("Average Score", f"{avg_score:.1f}")
-        
-    # Output
-    st.header("📋 Lead Generation Dashboard")
-    
-    # Filters
+
+    st.header("Lead Dashboard")
     col1, col2, col3 = st.columns(3)
     with col1:
         min_score = st.slider("Min Score", 0, 100, 0)
     with col2:
-        location_filter = st.text_input("Filter by Location", "")
+        location_filter = st.text_input("Filter by Location")
     with col3:
-        company_filter = st.text_input("Filter by Company", "")
-    
-    filtered_leads = [lead for lead in enriched_leads if lead['score'] >= min_score]
+        company_filter = st.text_input("Filter by Company")
+
+    filtered = [l for l in enriched_leads if l["score"] >= min_score]
     if location_filter:
-        filtered_leads = [lead for lead in filtered_leads if location_filter.lower() in lead.get('location', '').lower()]
+        filtered = [l for l in filtered if location_filter.lower() in l.get("location", "").lower()]
     if company_filter:
-        filtered_leads = [lead for lead in filtered_leads if company_filter.lower() in lead.get('company', '').lower()]
-    
-    df = pd.DataFrame(filtered_leads)
-    df = df[['score', 'name', 'title', 'company', 'location', 'email', 'linkedin']]
-    df.columns = ['Rank Probability', 'Name', 'Title', 'Company', 'Location', 'Email', 'LinkedIn']
-    
+        filtered = [l for l in filtered if company_filter.lower() in l.get("company", "").lower()]
+
+    df = pd.DataFrame(filtered)[["score", "name", "title", "company", "location", "email", "linkedin"]]
+    df.columns = ["Score", "Name", "Title", "Company", "Location", "Email", "LinkedIn"]
     st.dataframe(df, use_container_width=True)
-    
-    # Chart
+
     if enriched_leads:
         import plotly.express as px
-        score_df = pd.DataFrame({'Score': [lead['score'] for lead in enriched_leads]})
-        fig = px.histogram(score_df, x='Score', nbins=10, title="Lead Score Distribution")
+        fig = px.histogram(
+            pd.DataFrame({"Score": [l["score"] for l in enriched_leads]}),
+            x="Score", nbins=10, title="Lead Score Distribution",
+        )
         st.plotly_chart(fig, use_container_width=True)
-    
-    # Export
-    csv = df.to_csv(index=False)
-    st.download_button("📥 Download as CSV", csv, "leads.csv", "text/csv")
-    
-    # Email Draft
-    st.header("📧 Email Outreach")
-    if filtered_leads:
-        selected_name = st.selectbox("Select a lead to draft email:", [lead['name'] for lead in filtered_leads])
-        selected_lead = next(lead for lead in filtered_leads if lead['name'] == selected_name)
-        
-        subject = "Interest in 3D In-Vitro Models for Drug Safety Research"
-        body = f"""
-Dear {selected_lead['name']},
 
-I hope this email finds you well. My name is [Your Name], and I'm reaching out from [Your Company], where we specialize in advanced 3D in-vitro models for drug safety and toxicology research.
+    st.download_button("Download CSV", df.to_csv(index=False), "leads.csv", "text/csv")
 
-Given your expertise in {selected_lead.get('title', 'research')} at {selected_lead.get('company', 'your institution')}, I believe our solutions could greatly enhance your work on hepatic models and investigative toxicology.
-
-Would you be interested in learning more about how our technology can support your research?
-
-Best regards,
-[Your Name]
-[Your Position]
-[Your Contact Info]
-[Your Company]
-"""
-        
+    st.header("Email Outreach")
+    if filtered:
+        selected_name = st.selectbox("Select a lead:", [l["name"] for l in filtered])
+        lead = next(l for l in filtered if l["name"] == selected_name)
+        body = (
+            f"Dear {lead['name']},\n\n"
+            "My name is [Your Name] from [Your Company]. We specialise in advanced 3D in-vitro "
+            "models for drug safety and toxicology research.\n\n"
+            f"Given your work in {lead.get('title', 'research')} at {lead.get('company', 'your institution')}, "
+            "I believe our solutions could support your research.\n\n"
+            "Would you be open to a brief conversation?\n\n"
+            "Best regards,\n[Your Name]\n[Your Position]\n[Your Company]"
+        )
         st.text_area("Email Draft:", body, height=200)
-        
-        # Mailto link
-        body_encoded = body.replace('\n', '%0A').replace(' ', '%20')
-        mailto_link = f"mailto:{selected_lead.get('email', '')}?subject={subject}&body={body_encoded}"
-        st.markdown(f"[📤 Open in Email Client]({mailto_link})")
+        subject = "Interest in 3D In-Vitro Models for Drug Safety Research"
+        mailto = (
+            f"mailto:{lead.get('email', '')}?subject={subject}"
+            f"&body={body.replace(chr(10), '%0A').replace(' ', '%20')}"
+        )
+        st.markdown(f"[Open in Email Client]({mailto})")
     else:
-        st.write("No leads to select.")
+        st.info("No leads match the current filters.")
+
 
 if __name__ == "__main__":
     run_biotech_pipeline()
